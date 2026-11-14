@@ -144,7 +144,9 @@ def manage(t, S):
     return None
 
 def main():
+    first = not os.path.exists(STATE)
     S = load(); t_now = now(); today = iso(t_now)[:10]
+    if first: tg("✅ DOLF серия 2: бумажный сканер шортов пампов запущен (BingX, каждые 15 мин). Пишу только при сигнале, исполнении, закрытии и раз в день сводку.")
     tick = get(BX + "/openApi/swap/v2/quote/ticker")["data"]
     msgs = []
     # 1) ведение
