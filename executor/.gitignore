@@ -1,9 +1,0 @@
-.env
-state.json
-state.json.tmp
-executor.lock
-STOP
-logs/
-.venv/
-__pycache__/
-*.pyc
