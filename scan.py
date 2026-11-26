@@ -77,7 +77,7 @@ def journal(t):
         if new: w.writerow(["id","coin","opened","closed","avg","stop","filled_share","R_paper","R_real","fee_R","funding_R","R_net","exits","oi_src"])
         w.writerow([t["id"], t["coin"], iso(t["t0"]), iso(t.get("tclose", now())), t.get("avg"), t["stop"], round(t.get("filled", 0), 2),
                     round(t["R_paper"], 3), round(t["R_real"], 3), round(t["fee_R"], 3), round(t["fund_R"], 3),
-                    round(t["R_real"] - t["fee_R"] + t["fund_R"], 3), ";".join(t["exits"]), t["oi_src"]])
+                    round(t["R_real"] - t["fee_R"] + t["fund_R"], 3), ";".join(t["exits"]), t["oi_src"] + (" | вне лимита" if t.get("ol") else "")])
 
 # ---- ведение открытых сделок по 1m-свечам ----
 def manage(t, S):
@@ -152,15 +152,19 @@ def main():
     # 1) ведение
     for t in S["trades"]:
         if t["state"] in ("pending", "open"):
-            was = t["state"]; ev = manage(t, S)
+            was = t["state"]; ev = manage(t, S); tag = " (вне лимита)" if t.get("ol") else ""
             if t["state"] == "open" and was == "pending":
-                msgs.append(f"🟡 {t['coin']} шорт: исполнена лимитка, средняя {t['avg']:.6g}, стоп {t['stop']:.6g}")
+                msgs.append(f"🟡 {t['coin']}{tag} шорт: исполнена лимитка, средняя {t['avg']:.6g}, стоп {t['stop']:.6g}")
             if ev == "closed":
                 net = t["R_real"] - t["fee_R"] + t["fund_R"]
-                S["bal"] += net * t["risk_usd"]; journal(t)
-                msgs.append(f"⚪ {t['coin']} закрыт: бумага {t['R_paper']:+.2f}R, реально {net:+.2f}R (комиссии {t['fee_R']:.2f}R). Баланс {S['bal']:.2f}$")
+                if t.get("ol"):
+                    S["ol_R"] = S.get("ol_R", 0.0) + net; journal(t)
+                    msgs.append(f"⚪ {t['coin']}{tag} закрыт: бумага {t['R_paper']:+.2f}R, реально {net:+.2f}R (комиссии {t['fee_R']:.2f}R). В баланс не идёт, вне лимита всего {S['ol_R']:+.2f}R")
+                else:
+                    S["bal"] += net * t["risk_usd"]; journal(t)
+                    msgs.append(f"⚪ {t['coin']} закрыт: бумага {t['R_paper']:+.2f}R, реально {net:+.2f}R (комиссии {t['fee_R']:.2f}R). Баланс {S['bal']:.2f}$")
             elif ev == "expired":
-                msgs.append(f"⏳ {t['coin']}: лимитки не исполнились за 24ч, снято")
+                msgs.append(f"⏳ {t['coin']}{tag}: лимитки не исполнились за 24ч, снято")
     # 2) свой OI BingX для растущих монет
     for x in tick:
         sym = x["symbol"]
@@ -173,8 +177,8 @@ def main():
         if not S["oi"][sym]: del S["oi"][sym]
     # 3) скан
     btc = klines("BTC-USDT", "4h", 2); btc4h = (btc[-1][4] / btc[-1][1] - 1) * 100
-    day_trades = [t for t in S["trades"] if iso(t["t0"])[:10] == today and t["state"] != "rejected"]
-    day_R = sum(t["R_real"] - t["fee_R"] for t in S["trades"] if t["state"] == "closed" and iso(t.get("tclose", 0))[:10] == today)
+    day_trades = [t for t in S["trades"] if iso(t["t0"])[:10] == today and t["state"] != "rejected" and not t.get("ol")]
+    day_R = sum(t["R_real"] - t["fee_R"] for t in S["trades"] if t["state"] == "closed" and not t.get("ol") and iso(t.get("tclose", 0))[:10] == today)
     active = {t["sym"] for t in S["trades"] if t["state"] in ("pending", "open")}
     for x in tick:
         sym = x["symbol"]
@@ -191,8 +195,7 @@ def main():
             print("нет OI", sym); continue
         drop = 1 - series[-1] / max(series)
         if drop < OI_DROP or btc4h > BTC4H_MAX: continue
-        if len(day_trades) >= MAX_NEW_PER_DAY or day_R <= DAY_LIMIT_R:
-            msgs.append(f"🚫 {coin}: сигнал есть, но лимит дня"); continue
+        ol = len(day_trades) >= MAX_NEW_PER_DAY or day_R <= DAY_LIMIT_R   # лимит дня: сделку всё равно ведём, но отдельно (вне лимита)
         last, high = float(x["lastPrice"]), float(x["highPrice"])
         grid = [{"p": last * k, "w": w, "f": False} for k, w in GRID]
         stop = grid[-1]["p"] * STOP_PAD
@@ -202,18 +205,20 @@ def main():
         t = {"id": len(S["trades"]) + 1, "sym": sym, "coin": coin, "t0": t_now, "checked": t_now, "state": "pending",
              "grid": grid, "stop": stop, "plan_avg_dist": stop - avg, "filled": 0, "rem": 1.0, "hit": [], "exits": [],
              "R_paper": 0.0, "R_real": 0.0, "fee_R": 0.0, "fund_R": 0.0, "risk_usd": risk_usd, "oi_src": src,
-             "pump": chg, "oi_drop": round(drop * 100, 1), "btc4h": round(btc4h, 2)}
-        S["trades"].append(t); day_trades.append(t)
+             "pump": chg, "oi_drop": round(drop * 100, 1), "btc4h": round(btc4h, 2), "ol": ol}
+        S["trades"].append(t)
+        if not ol: day_trades.append(t)
         tps = [avg - r * (stop - avg) for r, _ in TGT_R]
-        msgs.append(f"🔴 БУМАГА шорт {coin} (BingX): памп +{chg:.0f}%, OI −{drop*100:.1f}% от макс 12ч ({src}), BTC 4ч {btc4h:+.1f}%\n"
+        msgs.append(f"🔴 БУМАГА шорт {coin}{' (вне лимита)' if ol else ''} (BingX): памп +{chg:.0f}%, OI −{drop*100:.1f}% от макс 12ч ({src}), BTC 4ч {btc4h:+.1f}%\n"
                     f"Сетка: {', '.join(f'{e['p']:.6g}' for e in grid)} (30/30/40)\nСтоп {stop:.6g} ({(stop/avg-1)*100:.1f}%)\n"
-                    f"Цели {', '.join(f'{p:.6g}' for p in tps)} (40/30/30), БУ после T1\nРиск 1R = {risk_usd:.2f}$. Это не сигнал на реал.")
+                    f"Цели {', '.join(f'{p:.6g}' for p in tps)} (40/30/30), БУ после T1\nРиск 1R = {risk_usd:.2f}$. Это не сигнал на реал." + ("\n⚠️ Вне лимита дня: сделка ведётся для статистики, в баланс не идёт." if ol else ""))
     # 4) сводка раз в день (после 18:00 UTC)
     if dt.datetime.now(dt.timezone.utc).hour >= 18 and S["summary_day"] != today:
         S["summary_day"] = today
-        closed = [t for t in S["trades"] if t["state"] == "closed"]
+        closed = [t for t in S["trades"] if t["state"] == "closed" and not t.get("ol")]
+        n_ol = sum(1 for t in S["trades"] if t["state"] == "closed" and t.get("ol"))
         net = sum(t["R_real"] - t["fee_R"] + t["fund_R"] for t in closed)
-        msgs.append(f"📊 Серия 2: закрыто {len(closed)}, реально {net:+.2f}R, бумага {sum(t['R_paper'] for t in closed):+.2f}R, баланс {S['bal']:.2f}$. Открыто/ждут: {len(active)}")
+        msgs.append(f"📊 Серия 2: закрыто {len(closed)}, реально {net:+.2f}R, бумага {sum(t['R_paper'] for t in closed):+.2f}R, баланс {S['bal']:.2f}$. Открыто/ждут: {len(active)}" + (f". Вне лимита: закрыто {n_ol}, {S.get('ol_R', 0.0):+.2f}R" if n_ol else ""))
     S["last_check"] = t_now
     json.dump(S, open(STATE, "w"), indent=1)
     for m in msgs: tg(m)
