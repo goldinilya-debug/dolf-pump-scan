@@ -1,23 +1,38 @@
 name: pump-scan
+# GitHub throttles scheduled runs (seen: ~every 9 h instead of 15 min).
+# So one run loops for ~5.5 h, scanning every 15 min, then re-dispatches itself.
+# The hourly schedule is only a backup in case the chain breaks.
 on:
-  schedule: [{cron: "*/15 * * * *"}]
+  schedule: [{cron: "7 * * * *"}]
   workflow_dispatch:
-permissions: {contents: write}
+permissions: {contents: write, actions: write}
 concurrency: {group: scan, cancel-in-progress: false}
 jobs:
   scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 350
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with: {python-version: "3.12"}
-      - run: python scan.py
+      - name: Scan every 15 min for ~5.5 h
         env:
           TG_TOKEN: ${{ secrets.TG_TOKEN }}
           TG_CHAT: ${{ secrets.TG_CHAT }}
           OPENMARKET_KEY: ${{ secrets.OPENMARKET_KEY }}
-      - run: |
+        run: |
           git config user.name pumpbot; git config user.email pumpbot@users.noreply.github.com
-          git add state.json; [ -f journal.csv ] && git add journal.csv || true
-          git diff --cached --quiet || (git commit -m "state $(date -u +%F_%H%M)" && git push)
+          end=$(( $(date +%s) + 330*60 ))
+          while [ $(date +%s) -lt $end ]; do
+            git pull -q --rebase || true
+            timeout 240 python scan.py || echo "scan failed rc=$?"
+            git add state.json; [ -f journal.csv ] && git add journal.csv || true
+            git diff --cached --quiet || (git commit -q -m "state $(date -u +%F_%H%M)" && (git push -q || (git pull -q --rebase && git push -q))) || true
+            s=$(( 900 - $(date +%s) % 900 + 60 ))
+            [ $(( $(date +%s) + s )) -ge $end ] && break
+            sleep $s
+          done
+      - name: Re-dispatch next loop
+        if: always()
+        env: {GH_TOKEN: "${{ github.token }}"}
+        run: gh workflow run scan.yml --ref main -R ${{ github.repository }}
